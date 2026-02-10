@@ -102,9 +102,7 @@ public sealed class ProxyService(HttpClient httpClient, ProxyServiceOptions opti
             return Results.Json(OpenAiError("upstream_connection_error", "Failed to reach upstream Codex API."), statusCode: 502);
         }
 
-        // HttpResponseMessage 仅实现 IDisposable，不是 IAsyncDisposable，
-        // 因此这里必须使用 using，而不是 await using。
-        using var _ = upstreamResponse;
+
         context.Response.StatusCode = (int)upstreamResponse.StatusCode;
 
         var contentType = upstreamResponse.Content.Headers.ContentType?.ToString();
