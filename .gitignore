@@ -10,3 +10,6 @@ obj/
 
 # OS
 .DS_Store
+
+# Legacy Rust artifact (not used in .NET project)
+Cargo.lock
