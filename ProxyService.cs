@@ -102,7 +102,7 @@ public sealed class ProxyService(HttpClient httpClient, ProxyServiceOptions opti
             return Results.Json(OpenAiError("upstream_connection_error", "Failed to reach upstream Codex API."), statusCode: 502);
         }
 
-        await using var _ = upstreamResponse;
+
         context.Response.StatusCode = (int)upstreamResponse.StatusCode;
 
         var contentType = upstreamResponse.Content.Headers.ContentType?.ToString();
