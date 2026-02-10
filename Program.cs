@@ -1,399 +1,275 @@
+using System.Diagnostics;
 using System.Text;
-using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Json.Serialization;
+using CodexOpenAIProxy;
+using Serilog;
 
-// 启动参数配置：负责解析端口和认证文件路径。
-var options = new ProxyOptions(args);
-// 创建 ASP.NET Core Minimal API 应用构建器。
-var builder = WebApplication.CreateBuilder(args);
+// =============================
+// 启动阶段：读取运行配置
+// =============================
+// BIND/PORT 控制监听地址与端口，默认仅监听本机 127.0.0.1:8181。
+var bind = Environment.GetEnvironmentVariable("BIND") ?? "127.0.0.1";
+var port = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var parsedPort) ? parsedPort : 8181;
 
-var app = builder.Build();
-// 启动时预加载认证信息，避免每个请求都去重复读取磁盘。
-var authData = await AuthData.LoadAsync(options.AuthPath);
+// 上游 Codex API 基础地址，可通过环境变量覆盖。
+var upstreamBaseUrl = Environment.GetEnvironmentVariable("CODEX_UPSTREAM_BASE_URL") ?? "https://api.openai.com";
 
-// 健康检查接口，用于容器探活和外部监控。
-app.MapGet("/health", () => Results.Json(new { status = "ok", service = "codex-openai-proxy" }));
+// 默认 auth.json 路径；支持 CODEX_AUTH_PATH 自定义。
+var authPath = Environment.GetEnvironmentVariable("CODEX_AUTH_PATH") ?? AuthLoader.GetDefaultAuthPath();
 
-// 同时兼容 /models 与 /v1/models 两种路径，方便不同客户端直接接入。
-app.MapGet("/models", () => Results.Json(ModelResponses.GetModels()));
-app.MapGet("/v1/models", () => Results.Json(ModelResponses.GetModels()));
+// 若直接提供 CODEX_UPSTREAM_BEARER，则优先使用该令牌，不再读取 auth.json。
+var bearerOverride = Environment.GetEnvironmentVariable("CODEX_UPSTREAM_BEARER");
 
-// 同时兼容 OpenAI 常见的两个 chat completions 路径。
-app.MapPost("/chat/completions", (HttpContext context) => HandleChatCompletionAsync(context, authData));
-app.MapPost("/v1/chat/completions", (HttpContext context) => HandleChatCompletionAsync(context, authData));
+// 日志目录：Serilog 文件输出会落在 logs/app-YYYYMMDD.log。
+Directory.CreateDirectory("logs");
 
-app.Run($"http://0.0.0.0:{options.Port}");
+// =============================
+// 日志初始化：控制台 + 文件
+// =============================
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Information()
+    .Enrich.FromLogContext()
+    .WriteTo.Console()
+    .WriteTo.File(
+        path: "logs/app-.log",
+        rollingInterval: RollingInterval.Day,
+        retainedFileCountLimit: 14,
+        shared: true)
+    .CreateLogger();
 
-/// <summary>
-/// 处理 chat completions 请求。
-/// 说明：
-/// 1) 支持非流式（一次性返回）
-/// 2) 支持流式（SSE 分块返回）
-/// 3) 响应内容使用简单规则生成，便于本地联调与代理连通性验证
-/// </summary>
-static async Task<IResult> HandleChatCompletionAsync(HttpContext context, AuthData authData)
+try
 {
-    ChatCompletionsRequest? request;
-
-    try
+    // =============================
+    // 认证加载：环境变量优先，其次 auth.json
+    // =============================
+    string upstreamToken;
+    if (!string.IsNullOrWhiteSpace(bearerOverride))
     {
-        request = await JsonSerializer.DeserializeAsync<ChatCompletionsRequest>(context.Request.Body);
+        upstreamToken = bearerOverride;
+        Log.Information("Using upstream bearer token from CODEX_UPSTREAM_BEARER.");
     }
-    catch (JsonException)
+    else
     {
-        return Results.BadRequest("Invalid JSON payload.");
+        var authResult = await AuthLoader.LoadTokenAsync(authPath);
+        upstreamToken = authResult.Token;
+
+        // 仅记录“命中的条目路径”，不打印 token 本文。
+        Log.Information("Loaded Codex token from {AuthPath}. Selected entry: {EntryName}", authPath, authResult.EntryName);
     }
 
-    if (request is null)
+    var builder = WebApplication.CreateBuilder(args);
+    builder.Host.UseSerilog();
+
+    // 注入代理配置：非流式请求默认 120 秒超时；流式请求不做固定超时限制。
+    builder.Services.AddSingleton(new ProxyServiceOptions
     {
-        return Results.BadRequest("Request body is required.");
-    }
+        UpstreamBaseUrl = upstreamBaseUrl,
+        UpstreamBearerToken = upstreamToken,
+        NonStreamingTimeout = TimeSpan.FromSeconds(120)
+    });
 
-    if (request.Stream ?? false)
+    builder.Services.AddSingleton<ModelMapper>();
+
+    // HttpClient 使用无限超时，真正超时逻辑由 ProxyService 按 stream/non-stream 区分控制。
+    builder.Services.AddHttpClient<ProxyService>()
+        .ConfigureHttpClient(client => { client.Timeout = Timeout.InfiniteTimeSpan; });
+
+    var app = builder.Build();
+
+    // =============================
+    // 请求日志中间件
+    // =============================
+    // 作用：
+    // 1) 为每个请求分配 requestId
+    // 2) 记录请求行、headers 摘要、可选 body 摘要
+    // 3) 记录响应状态码与耗时
+    // 4) 异常时记录堆栈
+    app.Use(async (context, next) =>
     {
-        // 配置 SSE（Server-Sent Events）响应头。
-        context.Response.StatusCode = StatusCodes.Status200OK;
-        context.Response.ContentType = "text/event-stream";
-        context.Response.Headers.CacheControl = "no-cache";
-        context.Response.Headers.Connection = "keep-alive";
+        var requestId = Guid.NewGuid().ToString("N")[..12];
+        context.Items["RequestId"] = requestId;
 
-        var chunkId = $"chatcmpl-{Guid.NewGuid()}";
-        var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var model = request.Model ?? "gpt-5";
-        var content = ResponseGenerator.GenerateContextualResponse(request.Messages ?? new());
+        var sw = Stopwatch.StartNew();
+        var method = context.Request.Method;
+        var path = context.Request.Path.ToString();
 
-        // 注意：这里显式声明为 object[]，因为三个 chunk 的 delta 结构并不完全一致。
-        // 如果使用 new[] 让编译器推断匿名类型，会因匿名对象结构不一致导致编译错误。
-        var chunks = new object[]
+        var requestBodyPreview = await ReadBodyPreviewAsync(context.Request, maxBytes: 64 * 1024);
+        var headerSummary = BuildHeaderSummary(context.Request.Headers);
+
+        Log.Information("[{RequestId}] --> {Method} {Path} headers={Headers}", requestId, method, path, headerSummary);
+
+        // 仅在 Development 输出 body 摘要，避免生产环境日志过大或泄露输入。
+        if (app.Environment.IsDevelopment() && !string.IsNullOrWhiteSpace(requestBodyPreview))
         {
-            new
-            {
-                id = chunkId,
-                @object = "chat.completion.chunk",
-                created,
-                model,
-                choices = new[] { new { index = 0, delta = new { role = "assistant" }, finish_reason = (string?)null } }
-            },
-            new
-            {
-                id = chunkId,
-                @object = "chat.completion.chunk",
-                created,
-                model,
-                choices = new[] { new { index = 0, delta = new { content }, finish_reason = (string?)null } }
-            },
-            new
-            {
-                id = chunkId,
-                @object = "chat.completion.chunk",
-                created,
-                model,
-                choices = new[] { new { index = 0, delta = new { }, finish_reason = (string?)"stop" } }
-            }
-        };
-
-        // 逐块写出 SSE 数据，每一块都遵循 "data: ...\n\n" 规范。
-        foreach (var chunk in chunks)
-        {
-            await context.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n");
-            await context.Response.Body.FlushAsync();
+            Log.Debug("[{RequestId}] request_body={Body}", requestId, requestBodyPreview);
         }
 
-        await context.Response.WriteAsync("data: [DONE]\n\n");
-        await context.Response.Body.FlushAsync();
-        return Results.Empty;
-    }
-
-    // 非流式模式下，一次性返回标准的 chat.completion 结构。
-    var response = new ChatCompletionsResponse
-    {
-        Id = $"chatcmpl-{Guid.NewGuid()}",
-        Object = "chat.completion",
-        Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-        Model = request.Model ?? "gpt-5",
-        Choices =
-        [
-            new Choice
-            {
-                Index = 0,
-                Message = new ChatResponseMessage
-                {
-                    Role = "assistant",
-                    Content = "I can help you with coding tasks! The C# proxy connection is working well."
-                },
-                FinishReason = "stop"
-            }
-        ],
-        Usage = new Usage
+        try
         {
-            PromptTokens = 50,
-            CompletionTokens = 30,
-            TotalTokens = 80
+            await next();
         }
-    };
-
-    return Results.Json(response);
-}
-
-internal sealed class ProxyOptions
-{
-    /// <summary>
-    /// 服务监听端口，默认 8080。
-    /// </summary>
-    public int Port { get; }
-
-    /// <summary>
-    /// 认证信息文件路径，默认 ~/.codex/auth.json。
-    /// </summary>
-    public string AuthPath { get; }
-
-    public ProxyOptions(string[] args)
-    {
-        Port = 8080;
-        AuthPath = "~/.codex/auth.json";
-
-        for (var i = 0; i < args.Length; i++)
+        catch (Exception ex)
         {
-            if (args[i] is "--port" or "-p")
-            {
-                if (i + 1 < args.Length && int.TryParse(args[i + 1], out var port))
-                {
-                    Port = port;
-                    i++;
-                }
-            }
-            else if (args[i] == "--auth-path" && i + 1 < args.Length)
-            {
-                AuthPath = args[i + 1];
-                i++;
-            }
+            Log.Error(ex, "[{RequestId}] Unhandled exception", requestId);
+            throw;
         }
-    }
-}
-
-internal sealed class AuthData
-{
-    /// <summary>
-    /// 兼容 OPENAI_API_KEY 形式的密钥字段。
-    /// </summary>
-    public string? OpenAIApiKey { get; init; }
-
-    /// <summary>
-    /// OAuth/会话相关 token 信息。
-    /// </summary>
-    public TokenData? Tokens { get; init; }
-
-    /// <summary>
-    /// 从指定路径加载认证信息。
-    /// 支持使用 ~/ 前缀表示用户主目录。
-    /// </summary>
-    public static async Task<AuthData> LoadAsync(string authPath)
-    {
-        var expandedPath = authPath.StartsWith("~/", StringComparison.Ordinal)
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), authPath[2..])
-            : authPath;
-
-        if (!File.Exists(expandedPath))
+        finally
         {
-            return new AuthData();
+            sw.Stop();
+            Log.Information("[{RequestId}] {Method} {Path} {StatusCode} {ElapsedMs}ms",
+                requestId,
+                method,
+                path,
+                context.Response.StatusCode,
+                sw.ElapsedMilliseconds);
         }
+    });
 
-        var json = await File.ReadAllTextAsync(expandedPath);
-        var root = JsonNode.Parse(json)?.AsObject();
+    // 健康检查，便于探活。
+    app.MapGet("/health", () => Results.Json(new { status = "ok" }));
 
-        return new AuthData
-        {
-            OpenAIApiKey = root?["OPENAI_API_KEY"]?.GetValue<string>(),
-            Tokens = root?["tokens"] is JsonObject tokenObj
-                ? new TokenData
-                {
-                    AccessToken = tokenObj["access_token"]?.GetValue<string>(),
-                    AccountId = tokenObj["account_id"]?.GetValue<string>(),
-                    RefreshToken = tokenObj["refresh_token"]?.GetValue<string>()
-                }
-                : null
-        };
-    }
-}
-
-internal sealed class TokenData
-{
-    /// <summary>
-    /// 访问令牌。
-    /// </summary>
-    public string? AccessToken { get; init; }
-
-    /// <summary>
-    /// 账户标识。
-    /// </summary>
-    public string? AccountId { get; init; }
-
-    /// <summary>
-    /// 刷新令牌。
-    /// </summary>
-    public string? RefreshToken { get; init; }
-}
-
-internal static class ModelResponses
-{
-    public static object GetModels() => new
+    // OpenAI-compatible: 模型列表接口。
+    app.MapGet("/v1/models", (ModelMapper mapper) => Results.Json(new
     {
         @object = "list",
-        data = new[]
+        data = mapper.GetExternalModels().Select(model => new
         {
-            new { id = "gpt-4", @object = "model", created = 1687882411, owned_by = "openai" },
-            new { id = "gpt-5", @object = "model", created = 1687882411, owned_by = "openai" }
+            id = model,
+            @object = "model",
+            created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            owned_by = "codex-proxy"
+        })
+    }));
+
+    // OpenAI-compatible: /v1/responses
+    // 策略：尽量少做强校验，只在 JSON 非法时返回 400；其他字段尽量透传。
+    app.MapPost("/v1/responses", async (HttpContext context, ProxyService proxyService, ModelMapper mapper) =>
+    {
+        var json = await ReadJsonBodyAsync(context);
+        if (json is null)
+        {
+            return Results.Json(OpenAiError("invalid_request_error", "Invalid JSON payload."), statusCode: 400);
         }
-    };
+
+        var rewritten = proxyService.BuildResponsesRequest(json, mapper);
+        return await proxyService.ForwardResponsesAsync(context, rewritten, context.RequestAborted);
+    });
+
+    // OpenAI-compatible: /v1/chat/completions
+    // 桥接策略：将 messages 转换到 responses.input，然后统一走上游 /v1/responses。
+    app.MapPost("/v1/chat/completions", async (HttpContext context, ProxyService proxyService, ModelMapper mapper) =>
+    {
+        var json = await ReadJsonBodyAsync(context);
+        if (json is null)
+        {
+            return Results.Json(OpenAiError("invalid_request_error", "Invalid JSON payload."), statusCode: 400);
+        }
+
+        var rewritten = proxyService.BuildResponsesRequestFromChat(json, mapper);
+        return await proxyService.ForwardResponsesAsync(context, rewritten, context.RequestAborted);
+    });
+
+    app.Lifetime.ApplicationStarted.Register(() =>
+    {
+        Log.Information("Codex OpenAI proxy listening on http://{Bind}:{Port}, upstream={Upstream}", bind, port, upstreamBaseUrl);
+    });
+
+    await app.RunAsync($"http://{bind}:{port}");
+    return;
+}
+catch (Exception ex)
+{
+    Log.Fatal(ex, "Failed to start proxy.");
+    Environment.ExitCode = 1;
+}
+finally
+{
+    await Log.CloseAndFlushAsync();
 }
 
-internal static class ResponseGenerator
+/// <summary>
+/// 从请求体读取 JSON 对象。
+/// - 返回 null：JSON 非法或非对象。
+/// - 注意：本层不做严格 schema 校验，尽量兼容 Cursor 可能附带的扩展字段。
+/// </summary>
+static async Task<JsonObject?> ReadJsonBodyAsync(HttpContext context)
 {
-    /// <summary>
-    /// 根据最近一条 user 消息生成上下文回复。
-    /// 当前实现是启发式规则，目标是用于联调，不追求复杂语义能力。
-    /// </summary>
-    public static string GenerateContextualResponse(List<ChatMessage> messages)
+    try
     {
-        var lastUser = messages.LastOrDefault(m => m.Role == "user");
-        var content = lastUser?.Content;
-
-        if (content is null)
-        {
-            return "I'm ready to help with coding tasks, debugging, and implementation questions.";
-        }
-
-        if (content is JsonValue value && value.TryGetValue<string>(out var text) && !string.IsNullOrWhiteSpace(text))
-        {
-            var lowered = text.ToLowerInvariant();
-            if (lowered.Contains("hello") || lowered.Contains("hi"))
-            {
-                return "Hello! I can help you with coding tasks, debugging, and software development questions.";
-            }
-
-            if (lowered.Contains("fix") || lowered.Contains("bug") || lowered.Contains("error"))
-            {
-                return "I'd be happy to help fix bugs and errors. Share the error details and code context.";
-            }
-
-            return "I can help with your request. Please share more implementation details so I can assist precisely.";
-        }
-
-        return "I can see your request context and I'm ready to help with the next coding step.";
+        var node = await JsonNode.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
+        return node as JsonObject;
+    }
+    catch
+    {
+        return null;
     }
 }
 
-internal sealed class ChatCompletionsRequest
+/// <summary>
+/// 读取请求体摘要用于日志排查。
+/// - 最大读取 maxBytes，超出则追加 "...(truncated)"。
+/// - 读取后会重置流位置，避免影响后续业务读取请求体。
+/// </summary>
+static async Task<string> ReadBodyPreviewAsync(HttpRequest request, int maxBytes)
 {
-    /// <summary>
-    /// 客户端请求的模型名。
-    /// </summary>
-    public string? Model { get; init; }
+    if (request.Body.CanSeek)
+    {
+        request.Body.Position = 0;
+    }
+    else
+    {
+        request.EnableBuffering();
+    }
 
-    /// <summary>
-    /// 对话消息列表。
-    /// </summary>
-    public List<ChatMessage>? Messages { get; init; }
+    var buffer = new byte[maxBytes + 1];
+    var read = await request.Body.ReadAsync(buffer.AsMemory(0, maxBytes + 1));
+    request.Body.Position = 0;
 
-    /// <summary>
-    /// 是否启用流式返回。
-    /// </summary>
-    public bool? Stream { get; init; }
+    var truncated = read > maxBytes;
+    var body = Encoding.UTF8.GetString(buffer, 0, Math.Min(read, maxBytes));
+    return truncated ? $"{body}...(truncated)" : body;
 }
 
-internal sealed class ChatMessage
+/// <summary>
+/// OpenAI 风格错误对象。
+/// </summary>
+static object OpenAiError(string type, string message) => new
 {
-    /// <summary>
-    /// 消息角色（如 user / assistant / system）。
-    /// </summary>
-    public string Role { get; init; } = "user";
+    error = new
+    {
+        type,
+        message
+    }
+};
 
-    /// <summary>
-    /// 消息内容，使用 JsonNode 以兼容字符串或多模态结构。
-    /// </summary>
-    public JsonNode? Content { get; init; }
-}
-
-internal sealed class ChatCompletionsResponse
+/// <summary>
+/// 提取并脱敏关键请求头，输出日志摘要。
+/// </summary>
+static string BuildHeaderSummary(IHeaderDictionary headers)
 {
-    /// <summary>
-    /// 响应唯一 ID。
-    /// </summary>
-    public required string Id { get; init; }
+    static string Mask(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return value;
+        if (value.Length <= 8) return "****";
+        return $"{value[..4]}****{value[^4..]}";
+    }
 
-    /// <summary>
-    /// 对象类型，通常为 chat.completion。
-    /// </summary>
-    public required string Object { get; init; }
+    var selected = new[] { "authorization", "content-type", "user-agent", "x-request-id" };
+    var pairs = new List<string>();
 
-    /// <summary>
-    /// Unix 秒级时间戳。
-    /// </summary>
-    public long Created { get; init; }
+    foreach (var key in selected)
+    {
+        if (!headers.TryGetValue(key, out var value)) continue;
+        var raw = value.ToString();
 
-    /// <summary>
-    /// 实际返回所使用的模型名称。
-    /// </summary>
-    public required string Model { get; init; }
+        // 统一对 authorization/token 类字段做脱敏，避免凭据泄露。
+        if (key.Contains("authorization", StringComparison.OrdinalIgnoreCase) || key.Contains("token", StringComparison.OrdinalIgnoreCase))
+        {
+            raw = Mask(raw);
+        }
 
-    /// <summary>
-    /// 候选结果列表。
-    /// </summary>
-    public required List<Choice> Choices { get; init; }
+        pairs.Add($"{key}={raw}");
+    }
 
-    /// <summary>
-    /// token 使用统计。
-    /// </summary>
-    public Usage? Usage { get; init; }
-}
-
-internal sealed class Choice
-{
-    /// <summary>
-    /// 当前候选在 choices 中的索引。
-    /// </summary>
-    public int Index { get; init; }
-
-    /// <summary>
-    /// assistant 消息内容。
-    /// </summary>
-    public required ChatResponseMessage Message { get; init; }
-    [JsonPropertyName("finish_reason")]
-
-    /// <summary>
-    /// 结束原因（例如 stop / length / content_filter）。
-    /// </summary>
-    public string? FinishReason { get; init; }
-}
-
-internal sealed class ChatResponseMessage
-{
-    /// <summary>
-    /// 消息角色。
-    /// </summary>
-    public required string Role { get; init; }
-
-    /// <summary>
-    /// 消息文本。
-    /// </summary>
-    public required string Content { get; init; }
-}
-
-internal sealed class Usage
-{
-    /// <summary>
-    /// 输入 token 数。
-    /// </summary>
-    public int PromptTokens { get; init; }
-
-    /// <summary>
-    /// 输出 token 数。
-    /// </summary>
-    public int CompletionTokens { get; init; }
-
-    /// <summary>
-    /// 总 token 数。
-    /// </summary>
-    public int TotalTokens { get; init; }
+    return string.Join(", ", pairs);
 }
